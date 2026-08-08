@@ -2,87 +2,84 @@ import requests
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
+import urllib.parse
 
 # 設定網頁頁面
 st.set_page_config(page_title="外資高持股監控系統", layout="wide")
 
 @st.cache_data(ttl=1800)
-def fetch_foreign_holding_data(date_str):
+def fetch_twse_data_proxy(date_str):
     """
-    優先從 FinMind API 獲取外資持股資料 (避免 TWSE 對雲端伺服器之 IP 封鎖)
+    透過代理伺服器從 TWSE 取得資料，以繞過 Streamlit Cloud (AWS) 的 IP 封鎖。
     """
-    # 格式轉換 YYYYMMDD -> YYYY-MM-DD
-    formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    target_url = f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&date={date_str}&selectType=ALL"
     
-    # 1. 嘗試使用 FinMind API
-    finmind_url = "https://api.finmindtrade.com/api/v4/data"
-    params = {
-        "dataset": "TaiwanStockForeignHoldingInfo",
-        "start_date": formatted_date,
-        "end_date": formatted_date
+    # 準備備援代理路由 (將網址編碼後交由公開代理伺服器代為抓取)
+    proxies = [
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(target_url)}",
+        f"https://corsproxy.io/?{urllib.parse.quote(target_url)}",
+        target_url # 最後嘗試直連
+    ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
-    try:
-        res = requests.get(finmind_url, params=params, timeout=12)
-        data = res.json()
-        if data.get("msg") == "success" and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            # 整理欄位
-            df = df.rename(columns={
-                "stock_id": "證券代號",
-                "stock_name": "證券名稱",
-                "foreignInvestmentSharesRatio": "全體外資及陸資持股比率(%)"
-            })
-            df["全體外資及陸資持股比率(%)"] = pd.to_numeric(df["全體外資及陸資持股比率(%)"], errors='coerce')
-            return df[['證券代號', '證券名稱', '全體外資及陸資持股比率(%)']]
-    except Exception as e:
-        pass
 
-    # 2. 備援：若 FinMind 失敗，嘗試直連 TWSE API
-    twse_url = f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&date={date_str}&selectType=ALL"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        res = requests.get(twse_url, headers=headers, timeout=10)
-        data = res.json()
-        if data.get('stat') == 'OK' and 'data' in data:
-            df = pd.DataFrame(data['data'], columns=data['fields'])
-            df = df[['證券代號', '證券名稱', '全體外資及陸資持股比率(%)']].copy()
-            df['全體外資及陸資持股比率(%)'] = df['全體外資及陸資持股比率(%)'].astype(str).str.replace(',', '', regex=False)
-            df['全體外資及陸資持股比率(%)'] = pd.to_numeric(df['全體外資及陸資持股比率(%)'], errors='coerce')
-            return df
-    except Exception as e:
-        pass
-
+    for p_url in proxies:
+        try:
+            res = requests.get(p_url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                # 確認證交所回傳的資料狀態為 OK 且具備 data 欄位
+                if data.get('stat') == 'OK' and 'data' in data:
+                    df = pd.DataFrame(data['data'], columns=data['fields'])
+                    
+                    # 僅取出目標的 3 個欄位
+                    target_cols = ['證券代號', '證券名稱', '全體外資及陸資持股比率(%)']
+                    df = df[target_cols].copy()
+                    
+                    # 清除千分位逗號並轉為浮點數
+                    df['全體外資及陸資持股比率(%)'] = df['全體外資及陸資持股比率(%)'].astype(str).str.replace(',', '', regex=False)
+                    df['全體外資及陸資持股比率(%)'] = pd.to_numeric(df['全體外資及陸資持股比率(%)'], errors='coerce')
+                    
+                    return df
+                elif data.get('stat') != 'OK':
+                    # 證交所明確回傳非 OK (代表該日確實沒開盤或無資料)，直接中斷尋找
+                    return pd.DataFrame()
+        except Exception:
+            # 發生網路阻擋或超時，自動嘗試下一個代理
+            continue
+            
     return pd.DataFrame()
 
 # UI 介面設計
 st.title("📈 台灣集中市場 - 外資高持股監控")
-st.markdown("本系統採用開放資料 API，支援手機直接瀏覽、篩選與排序。")
+st.markdown("本系統透過多重海外代理節點連線證交所，支援手機直接瀏覽、篩選與排序。")
 
 selected_date = st.date_input("📅 請選擇交易日 (T)", datetime.today())
 
 if st.button("🚀 開始抓取與比對分析", use_container_width=True):
-    with st.spinner("正在獲取資料，請稍候..."):
+    with st.spinner(f"正在透過海外節點獲取資料，請稍候..."):
         date_t_str = selected_date.strftime("%Y%m%d")
         
         # 1. 獲取 T 日資料
-        df_t = fetch_foreign_holding_data(date_t_str)
+        df_t = fetch_twse_data_proxy(date_t_str)
         
         if df_t.empty:
-            st.warning(f"⚠️ 日期 {date_t_str} 無資料！可能為假日（未開盤）、當日尚未收盤結算，或 API 進行例行維護。")
+            st.warning(f"⚠️ 日期 {date_t_str} 無資料！可能為假日（未開盤）、當日尚未收盤結算，或證交所 API 進行阻擋。")
         else:
             # 2. 篩選持股比率 > 30.0%
             df_t_filtered = df_t[df_t['全體外資及陸資持股比率(%)'] > 30.0].copy()
             
-            # 3. 自動往前尋找 T-1 個交易日 (最多尋找 10 天跳過假日)
+            # 3. 自動往前尋找 T-1 個交易日 (最多 10 天跳過連假)
             df_t1 = pd.DataFrame()
             days_back = 1
-            st.info("已取得當日資料，正在比對前一交易日相差值...")
+            st.info("✅ 已取得當日資料，正在比對前一交易日相差值...")
             
             while days_back <= 10:
                 t1_date = selected_date - timedelta(days=days_back)
                 date_t1_str = t1_date.strftime("%Y%m%d")
-                df_t1 = fetch_foreign_holding_data(date_t1_str)
+                df_t1 = fetch_twse_data_proxy(date_t1_str)
                 if not df_t1.empty:
                     break
                 days_back += 1
@@ -92,7 +89,7 @@ if st.button("🚀 開始抓取與比對分析", use_container_width=True):
                 final_df = df_t_filtered
                 final_df['外資持股比率相差(%)'] = 0.0
             else:
-                # 4. 計算持股相差
+                # 4. 重新命名昨日欄位並計算持股相差
                 df_t1_merged = df_t1[['證券代號', '全體外資及陸資持股比率(%)']].rename(
                     columns={'全體外資及陸資持股比率(%)': '昨日比率'}
                 )
